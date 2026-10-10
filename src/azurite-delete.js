@@ -335,6 +335,7 @@ async function run(opts) {
     }
     console.log(`\n  ${label}${t.prefix === "" ? "  (whole container)" : ""}`);
     if (!containerKnown) console.log(`    warning: no container named "${t.container}" exists`);
+    if (n === 0) printTargetHints(t, label, containers.data, blobs.data, accountOk, containerKnown);
     let detail = [];
     if (snapshots) detail.push(`${snapshots} snapshots`);
     if (uncommitted) detail.push(`${uncommitted} with no committed content yet`);
@@ -394,6 +395,28 @@ async function run(opts) {
   );
 }
 
+// A target matched nothing. Usually the "container" is really a folder inside
+// some other container, so look for the whole target string as a blob-name
+// prefix everywhere, and list the containers that do exist.
+function printTargetHints(t, label, containers, blobs, accountOk, containerKnown) {
+  const counts = new Map();
+  for (const c of containers) if (accountOk(c.accountName)) counts.set(c.name, 0);
+  const elsewhere = new Map();
+  for (const b of blobs) {
+    if (!accountOk(b.accountName)) continue;
+    counts.set(b.containerName, (counts.get(b.containerName) || 0) + 1);
+    if (typeof b.name === "string" && b.name.startsWith(label)) {
+      elsewhere.set(b.containerName, (elsewhere.get(b.containerName) || 0) + 1);
+    }
+  }
+  for (const [container, n] of elsewhere) {
+    console.log(`    hint: ${n.toLocaleString("en-US")} blobs in container "${container}" start with "${label}"; try --target "${container}/${label}"`);
+  }
+  if (!containerKnown) {
+    console.log(`    containers: ${[...counts].sort().map(([c, n]) => `${c} (${n.toLocaleString("en-US")})`).join(", ") || "(none)"}`);
+  }
+}
+
 function reportExtents(location, extentDbPath, allBlobs, allBlocks, keptBlobs, keptBlocks) {
   if (!fs.existsSync(extentDbPath)) {
     console.log(`\n(${EXTENT_DB} not found; skipping extent report)`);
@@ -410,9 +433,12 @@ function reportExtents(location, extentDbPath, allBlobs, allBlocks, keptBlobs, k
       return e.size || 0;
     }
   };
-  let freedN = 0, freedBytes = 0, alreadyN = 0, alreadyBytes = 0;
+  let freedN = 0, freedBytes = 0, alreadyN = 0, alreadyBytes = 0, keptN = 0;
   for (const e of extents) {
-    if (after.has(e.id)) continue;
+    if (after.has(e.id)) {
+      keptN++;
+      continue;
+    }
     if (before.has(e.id)) {
       freedN++;
       freedBytes += sizeOf(e);
@@ -424,8 +450,15 @@ function reportExtents(location, extentDbPath, allBlobs, allBlocks, keptBlobs, k
   console.log(`\nExtent files (${extents.length} total, ${EXTENT_DIR}):`);
   console.log(`  becoming unreferenced: ${freedN}, ${formatBytes(freedBytes)}`);
   if (alreadyN) console.log(`  already unreferenced (pending Azurite GC): ${alreadyN}, ${formatBytes(alreadyBytes)}`);
-  const shared = [...before].filter((id) => after.has(id)).length;
-  console.log(`  still referenced: ${shared} (space held by deleted blobs inside these is not reclaimed)`);
+  console.log(`  still referenced: ${keptN} (space held by deleted blobs inside these is not reclaimed)`);
+  // Blobs pointing at extents the extent DB doesn't list. Not caused by this
+  // tool; such blobs most likely fail to download in Azurite already.
+  const known = new Set(extents.map((e) => e.id));
+  const missing = [...after].filter((id) => !known.has(id));
+  if (missing.length) {
+    const onDisk = missing.filter((id) => fs.existsSync(path.join(location, EXTENT_DIR, id))).length;
+    console.log(`  note: remaining blobs reference ${missing.length} extent(s) not listed in ${EXTENT_DB} (${onDisk} of them exist on disk): ${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", ..." : ""}`);
+  }
 }
 
 async function main() {

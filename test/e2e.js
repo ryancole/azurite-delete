@@ -280,6 +280,10 @@ async function main() {
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /Nothing matched/);
   assert.match(r.out, /no container named "nosuchcontainer"/);
+  assert.match(r.out, /containers: ctr1 \(\d+\), ctr2 \(\d+\), ctr3 \(\d+\)/);
+  r = runTool("--target", "del/a/");
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /hint: 61 blobs in container "ctr1" start with "del\/a\/"; try --target "ctr1\/del\/a\/"/);
   assert.equal(fileHash(BLOB_DB), before);
   assert.equal(fs.existsSync(path.join(LOC, "azurite-delete-backups")), false);
 
