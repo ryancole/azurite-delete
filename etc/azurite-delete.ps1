@@ -14,17 +14,24 @@ to delete. See README.md.
 
 .EXAMPLE
 .\etc\azurite-delete.ps1 -Location C:\src\WhatInBox\.azurite -Target images/2024/, thumbnails
+
+.EXAMPLE
+.\etc\azurite-delete.ps1 -Location C:\src\WhatInBox\.azurite -Compact -CompactMinDead 10
 #>
 [CmdletBinding(DefaultParameterSetName = 'Container')]
 param(
     # Azurite data folder (the one holding __azurite_db_blob__.json).
     [Parameter(Mandatory)] [string] $Location,
-    # Container to delete from.
-    [Parameter(Mandatory, ParameterSetName = 'Container')] [string] $Container,
+    # Container to delete from. Optional with -Compact.
+    [Parameter(ParameterSetName = 'Container')] [string] $Container,
     # Blob name prefixes within -Container. Omit to delete the whole container.
     [Parameter(ParameterSetName = 'Container')] [Alias('Uri', 'Path')] [string[]] $Prefix,
     # Alternative for several containers at once: "container" or "container/prefix" values.
     [Parameter(Mandatory, ParameterSetName = 'Target')] [string[]] $Target,
+    # Rewrite partly-dead extent files so their dead space can be freed.
+    [switch] $Compact,
+    # With -Compact: only rewrite extents at least this % dead.
+    [ValidateRange(0, 100)] [int] $CompactMinDead = 25,
     [switch] $Apply,
     [string] $Account,
     [int] $BlobPort = 10000,
@@ -66,7 +73,12 @@ if (-not (Test-Path (Join-Path $here 'node_modules\lokijs'))) {
 }
 
 $nodeArgs = @('--max-old-space-size=4096', (Join-Path $here 'src\azurite-delete.js'), '--location', $Location)
-if ($PSCmdlet.ParameterSetName -eq 'Container') {
+if ($Prefix -and -not $Container) { throw '-Prefix needs -Container.' }
+if (-not $Container -and -not $Target -and -not $Compact) {
+    throw 'Give -Container (with optional -Prefix), -Target, and/or -Compact.'
+}
+if ($Compact) { $nodeArgs +=@('--compact', '--compact-min-dead', $CompactMinDead) }
+if ($Container) {
     $nodeArgs += @('--container', $Container)
     # An empty prefix means the whole container, same as no -Prefix. Don't pass it
     # on: Windows PowerShell drops empty arguments to native commands.

@@ -10,6 +10,7 @@ const path = require("path");
 const net = require("net");
 const { execFileSync } = require("child_process");
 const Loki = require("lokijs");
+const compact = require("./compact");
 
 const BLOB_DB = "__azurite_db_blob__.json";
 const EXTENT_DB = "__azurite_db_blob_extent__.json";
@@ -23,6 +24,7 @@ const BACKUP_DIR = "azurite-delete-backups";
 const USAGE = `Usage:
   azurite-delete --location <azurite folder> --container <name> [--prefix <p> ...] [--container ...] [options]
   azurite-delete --location <azurite folder> --target <container>[/<prefix>] [--target ...] [options]
+  azurite-delete --location <azurite folder> --compact [--compact-min-dead <percent>] [options]
 
 What to delete:
   --container images                        every blob in "images"
@@ -32,8 +34,14 @@ What to delete:
   --target images/2024/01/                  same as --container images --prefix 2024/01/
   Prefixes are ordinal and case-sensitive. A --prefix applies to the --container before it.
 
+Compaction (alone, or after deleting):
+  --compact                    copy the live data out of extent files that are partly dead
+                               into new packed files, so Azurite's GC can delete the old ones
+  --compact-min-dead <percent> only rewrite extents at least this % dead (default 25);
+                               the dry run shows the trade-off for other values
+
 Options:
-  --apply              actually delete (default is a dry run that changes nothing)
+  --apply              actually delete/compact (default is a dry run that changes nothing)
   --account <name>     only match this storage account (default: any account)
   --blob-port <port>   Azurite blob port to check before applying (default 10000)
   --samples <n>        sample blob names to print per target (default 5)
@@ -51,6 +59,8 @@ function parseArgs(argv) {
     blobPort: 10000,
     samples: 5,
     backup: true,
+    compact: false,
+    compactMinDead: 25,
   };
   const value = (i, name) => {
     if (i + 1 >= argv.length) throw new UsageError(`${name} needs a value`);
@@ -102,6 +112,13 @@ function parseArgs(argv) {
       case "--no-backup":
         opts.backup = false;
         break;
+      case "--compact":
+        opts.compact = true;
+        break;
+      case "--compact-min-dead":
+        opts.compactMinDead = Number(value(i++, a));
+        if (!(opts.compactMinDead >= 0 && opts.compactMinDead <= 100)) throw new UsageError("--compact-min-dead must be 0-100");
+        break;
       case "-h":
       case "--help":
         opts.help = true;
@@ -113,7 +130,9 @@ function parseArgs(argv) {
   endGroup();
   if (opts.help) return opts;
   if (!opts.location) throw new UsageError("--location is required");
-  if (opts.targets.length === 0) throw new UsageError("at least one --container (or --target) is required");
+  if (opts.targets.length === 0 && !opts.compact) {
+    throw new UsageError("give at least one --container (or --target), and/or --compact");
+  }
   return opts;
 }
 
@@ -160,12 +179,7 @@ function getCollection(db, name, file) {
 // BlobReferredExtentsAsyncIterator, which is what its GC uses for "mark".
 function referencedExtents(blobs, blocks) {
   const ids = new Set();
-  for (const b of blobs) {
-    for (const blk of b.committedBlocksInOrder || []) if (blk.persistency) ids.add(blk.persistency.id);
-    for (const r of b.pageRangesInOrder || []) if (r.persistency) ids.add(r.persistency.id);
-    if (b.persistency) ids.add(b.persistency.id);
-  }
-  for (const blk of blocks) if (blk.persistency) ids.add(blk.persistency.id);
+  compact.forEachReference(blobs, blocks, (p) => ids.add(p.id));
   return ids;
 }
 
@@ -338,7 +352,8 @@ async function run(opts) {
 
   const deleteBlob = new Set();
   const deleteBlock = new Set();
-  console.log(opts.apply ? "\nDeleting:" : "\nDry run (nothing will be changed; pass --apply to delete):");
+  if (!opts.apply) console.log("\nDry run (nothing will be changed; pass --apply to make changes)");
+  if (opts.targets.length > 0) console.log(opts.apply ? "\nDeleting:" : "\nWould delete:");
   for (const t of opts.targets) {
     const label = `${t.container}/${t.prefix}`;
     const containerKnown = containers.data.some((c) => c.name === t.container && accountOk(c.accountName));
@@ -374,21 +389,39 @@ async function run(opts) {
 
   const keptBlobs = blobs.data.filter((b) => !deleteBlob.has(b));
   const keptBlocks = blocks.data.filter((k) => !deleteBlock.has(k));
-  const totalBytes = [...deleteBlob].reduce((s, b) => s + ((b.properties && b.properties.contentLength) || 0), 0);
-  console.log(
-    `\nTotal: ${deleteBlob.size.toLocaleString("en-US")} blobs (${formatBytes(totalBytes)}) and ` +
-      `${deleteBlock.size.toLocaleString("en-US")} uncommitted blocks` +
-      `; ${keptBlobs.length.toLocaleString("en-US")} blobs remain.`
-  );
+  if (opts.targets.length > 0) {
+    const totalBytes = [...deleteBlob].reduce((s, b) => s + ((b.properties && b.properties.contentLength) || 0), 0);
+    console.log(
+      `\nTotal: ${deleteBlob.size.toLocaleString("en-US")} blobs (${formatBytes(totalBytes)}) and ` +
+        `${deleteBlock.size.toLocaleString("en-US")} uncommitted blocks` +
+        `; ${keptBlobs.length.toLocaleString("en-US")} blobs remain.`
+    );
+  }
 
-  reportExtents(location, extentDbPath, blobs.data, blocks.data, keptBlobs, keptBlocks);
+  let extentDb = null;
+  let extentStatBefore = null;
+  if (fs.existsSync(extentDbPath)) {
+    extentStatBefore = fs.statSync(extentDbPath);
+    extentDb = readLokiFile(extentDbPath);
+    reportExtents(location, getCollection(extentDb, EXTENTS, extentDbPath).data, blobs.data, blocks.data, keptBlobs, keptBlocks);
+  } else if (opts.compact) {
+    throw new Error(`${extentDbPath} not found; can't compact without it`);
+  } else {
+    console.log(`\n(${EXTENT_DB} not found; skipping extent report)`);
+  }
+
+  let toCompact = [];
+  if (opts.compact) {
+    toCompact = reportCompaction(location, getCollection(extentDb, EXTENTS, extentDbPath).data, keptBlobs, keptBlocks, opts.compactMinDead);
+  }
 
   if (!opts.apply) {
-    console.log("\nDry run only. Re-run with --apply (Azurite stopped) to delete.");
+    console.log("\nDry run only. Re-run with --apply (Azurite stopped) to make these changes.");
     return;
   }
-  if (deleteBlob.size === 0 && deleteBlock.size === 0) {
-    console.log("\nNothing matched; database left untouched.");
+  const deleting = deleteBlob.size > 0 || deleteBlock.size > 0;
+  if (!deleting && toCompact.length === 0) {
+    console.log(opts.targets.length > 0 ? "\nNothing matched; database left untouched." : "\nNothing to do; database left untouched.");
     return;
   }
 
@@ -396,30 +429,113 @@ async function run(opts) {
     const dir = path.join(location, BACKUP_DIR, timestamp());
     fs.mkdirSync(dir, { recursive: true });
     fs.copyFileSync(blobDbPath, path.join(dir, BLOB_DB));
-    if (fs.existsSync(extentDbPath)) fs.copyFileSync(extentDbPath, path.join(dir, EXTENT_DB));
+    if (extentDb) fs.copyFileSync(extentDbPath, path.join(dir, EXTENT_DB));
     console.log(`\nBacked up metadata to ${dir}`);
   }
 
-  blobs.data = keptBlobs;
-  blocks.data = keptBlocks;
-  rebuildIndexes(blobs);
-  rebuildIndexes(blocks);
-  // maxId is deliberately left alone so $loki ids are never reused.
-  const text = JSON.stringify(db);
-
-  // Last-moment guard: if Azurite started (or anything rewrote the file) while
-  // we were working, don't clobber it.
-  await assertAzuriteNotRunning(opts.blobPort);
-  const statNow = fs.statSync(blobDbPath);
-  if (statNow.mtimeMs !== statBefore.mtimeMs || statNow.size !== statBefore.size) {
-    throw new Error(`${blobDbPath} changed while this tool was running; nothing written`);
+  // Compaction: write and verify the new extents first. Nothing references them
+  // until the blob database below is written, so a failure before that point
+  // leaves the store as it was (plus orphaned files, which are cleaned up).
+  let copied = null;
+  if (toCompact.length > 0) {
+    const need = toCompact.reduce((s, x) => s + x.live, 0);
+    const free = freeBytes(location);
+    if (free !== null && free < need + 256 * 1024 * 1024) {
+      throw new Error(
+        `not enough free disk space to compact: need ${formatBytes(need)} for the new extents ` +
+          `(the old ones are deleted by Azurite afterwards), have ${formatBytes(free)}. Raise --compact-min-dead.`
+      );
+    }
+    console.log(`\nCompacting ${toCompact.length} extent files (copying ${formatBytes(need)})...`);
+    copied = compact.copySegments(location, toCompact, EXTENT_DIR, (m) => console.log(m));
+    console.log(`  wrote and verified ${copied.newExtents.length} new extent files`);
   }
-  writeAtomic(blobDbPath, text);
-  console.log(`Wrote ${blobDbPath} (${formatBytes(Buffer.byteLength(text))})`);
+
+  try {
+    blobs.data = keptBlobs;
+    blocks.data = keptBlocks;
+    if (copied) {
+      let n = 0;
+      compact.forEachReference(keptBlobs, keptBlocks, (p) => {
+        if (copied.remap(p)) n++;
+      });
+      console.log(`  repointed ${n.toLocaleString("en-US")} references`);
+    }
+    rebuildIndexes(blobs);
+    rebuildIndexes(blocks);
+    // maxId is deliberately left alone so $loki ids are never reused.
+    const text = JSON.stringify(db);
+
+    let extentText = null;
+    if (copied) {
+      const extColl = getCollection(extentDb, EXTENTS, extentDbPath);
+      for (const e of copied.newExtents) {
+        extColl.maxId = (extColl.maxId || 0) + 1;
+        extColl.data.push({ ...e, meta: { revision: 0, created: e.lastModifiedInMS, version: 0 }, $loki: extColl.maxId });
+      }
+      rebuildIndexes(extColl);
+      extentText = JSON.stringify(extentDb);
+    }
+
+    // Last-moment guard: if Azurite started (or anything rewrote the files)
+    // while we were working, don't clobber them.
+    await assertAzuriteNotRunning(opts.blobPort);
+    const unchanged = (file, before) => {
+      const now = fs.statSync(file);
+      return now.mtimeMs === before.mtimeMs && now.size === before.size;
+    };
+    if (!unchanged(blobDbPath, statBefore) || (extentStatBefore && !unchanged(extentDbPath, extentStatBefore))) {
+      throw new Error(`Azurite's metadata changed while this tool was running; nothing written`);
+    }
+    // Extent DB first: if we stop between the two writes, the new extents are
+    // merely listed but unreferenced, and Azurite's GC removes them.
+    if (extentText !== null) {
+      writeAtomic(extentDbPath, extentText);
+      console.log(`Wrote ${extentDbPath}`);
+    }
+    writeAtomic(blobDbPath, text);
+    console.log(`Wrote ${blobDbPath} (${formatBytes(Buffer.byteLength(text))})`);
+  } catch (e) {
+    if (copied) for (const f of copied.created) fs.rmSync(f, { force: true });
+    throw e;
+  }
   console.log(
     "Done. Start Azurite again: its blob GC runs at startup and then every 10 minutes, deleting extent " +
       "files under __blobstorage__ that nothing references and that weren't written in the last 10 minutes."
   );
+}
+
+function freeBytes(dir) {
+  try {
+    const s = fs.statfsSync(dir);
+    return s.bavail * s.bsize;
+  } catch {
+    return null;
+  }
+}
+
+// Print the compaction plan, with the trade-off at other thresholds, and
+// return the extents selected at minDeadPercent.
+function reportCompaction(location, extents, keptBlobs, keptBlocks, minDeadPercent) {
+  const plan = compact.planCompaction(location, extents, keptBlobs, keptBlocks, EXTENT_DIR);
+  const totalDead = plan.extents.reduce((s, x) => s + x.dead, 0);
+  console.log(`\nCompaction (${plan.extents.length} referenced extent files, ${formatBytes(totalDead)} dead inside them):`);
+  console.log("  min dead   files   copy              frees");
+  const thresholds = [...new Set([90, 75, 50, 25, 10, 0, minDeadPercent])].sort((a, b) => b - a);
+  for (const pct of thresholds) {
+    const s = compact.summarize(compact.selectExtents(plan, pct / 100));
+    const mb = (n) => `${(n / 1048576).toFixed(1)} MB`.padEnd(16);
+    const mark = pct === minDeadPercent ? "  <- --compact-min-dead" : "";
+    console.log(`  ${`${pct}%`.padStart(8)}   ${String(s.files).padStart(5)}   ${mb(s.copy)}  ${mb(s.freed)}${mark}`);
+  }
+  for (const p of plan.problems) console.log(`  note: ${p}`);
+  const selected = compact.selectExtents(plan, minDeadPercent / 100);
+  const s = compact.summarize(selected);
+  console.log(
+    `  Will rewrite ${s.files} files, copying ${formatBytes(s.copy)} into new extents; Azurite's GC then deletes ` +
+      `the old files, freeing ${formatBytes(s.freed)}.`
+  );
+  return selected;
 }
 
 // A target matched nothing. Usually the "container" is really a folder inside
@@ -444,12 +560,7 @@ function printTargetHints(t, label, containers, blobs, accountOk, containerKnown
   }
 }
 
-function reportExtents(location, extentDbPath, allBlobs, allBlocks, keptBlobs, keptBlocks) {
-  if (!fs.existsSync(extentDbPath)) {
-    console.log(`\n(${EXTENT_DB} not found; skipping extent report)`);
-    return;
-  }
-  const extents = getCollection(readLokiFile(extentDbPath), EXTENTS, extentDbPath).data;
+function reportExtents(location, extents, allBlobs, allBlocks, keptBlobs, keptBlocks) {
   const before = referencedExtents(allBlobs, allBlocks);
   const after = referencedExtents(keptBlobs, keptBlocks);
   const sizeOf = (e) => {
@@ -477,7 +588,7 @@ function reportExtents(location, extentDbPath, allBlobs, allBlocks, keptBlobs, k
   console.log(`\nExtent files (${extents.length} total, ${EXTENT_DIR}):`);
   console.log(`  becoming unreferenced: ${freedN}, ${formatBytes(freedBytes)}`);
   if (alreadyN) console.log(`  already unreferenced (pending Azurite GC): ${alreadyN}, ${formatBytes(alreadyBytes)}`);
-  console.log(`  still referenced: ${keptN} (space held by deleted blobs inside these is not reclaimed)`);
+  console.log(`  still referenced: ${keptN} (dead space inside these is only reclaimed by --compact)`);
   // Blobs pointing at extents the extent DB doesn't list. Not caused by this
   // tool; such blobs most likely fail to download in Azurite already.
   const known = new Set(extents.map((e) => e.id));

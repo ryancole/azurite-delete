@@ -19,6 +19,7 @@ const PORT = 20110;
 const OTHER_PORT = 20120;
 const BLOB_DB = path.join(LOC, "__azurite_db_blob__.json");
 const EXTENT_DIR = path.join(LOC, "__blobstorage__");
+const EXTENT_DB = path.join(LOC, "__azurite_db_blob_extent__.json");
 const KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
 const children = new Set();
@@ -133,6 +134,29 @@ async function uploadAppend(cc, name) {
   remember(cc.containerName, name, Buffer.concat([a, b]));
 }
 
+async function splitPages(cc, name) {
+  const pb = cc.getPageBlobClient(name);
+  await pb.create(8192);
+  const a = rand(4096), b = rand(1024);
+  await pb.uploadPages(a, 0, 4096);
+  await pb.uploadPages(b, 1024, 1024); // splits the first range around it
+  await pb.clearPages(3072, 512); // and trims another piece out of it
+  const full = Buffer.alloc(8192);
+  a.copy(full, 0);
+  b.copy(full, 1024);
+  full.fill(0, 3072, 3584);
+  const body = await streamToBuffer((await pb.download()).readableStreamBody);
+  assert.equal(sha(body), sha(full), "page blob after split writes");
+  remember(cc.containerName, name, full);
+}
+
+async function serverCopy(cc, from, to) {
+  const src = cc.getBlobClient(from);
+  const url = await src.generateSasUrl({ permissions: "r", expiresOn: new Date(Date.now() + 3600e3) });
+  await cc.getBlobClient(to).syncCopyFromURL(url);
+  remember(cc.containerName, to, await streamToBuffer((await src.download()).readableStreamBody));
+}
+
 async function snapshot(cc, name) {
   const { snapshot } = await cc.getBlobClient(name).createSnapshot();
   const base = expected.get(keyOf(cc.containerName, name));
@@ -165,6 +189,64 @@ function extentIdsIn(docs) {
 
 function loadRaw() {
   return JSON.parse(fs.readFileSync(BLOB_DB, "utf8"));
+}
+
+const extentsOf = (raw) => raw.collections.find((c) => c.name === "$EXTENTS_COLLECTION$");
+
+// Azurite's GC ignores extents modified in the last 10 minutes
+// (DEFAULT_EXTENT_GC_PROTECT_TIME_IN_MS). A real store's extents are old; age
+// this one's so the startup GC pass considers every extent, referenced or not.
+function ageExtents() {
+  const ext = JSON.parse(fs.readFileSync(EXTENT_DB, "utf8"));
+  for (const e of extentsOf(ext).data) e.LastModifyInMS = Date.now() - 60 * 60 * 1000;
+  fs.writeFileSync(EXTENT_DB, JSON.stringify(ext));
+}
+
+function referencedNow() {
+  const raw = loadRaw();
+  return extentIdsIn(raw.collections.filter((c) => c.name === "$BLOBS_COLLECTION$" || c.name === "$BLOCKS_COLLECTION$").map((c) => c.data));
+}
+
+// Live vs dead bytes in referenced extent files, computed independently of the
+// tool: merge every referenced range per extent.
+function deadSpace() {
+  const raw = loadRaw();
+  const ranges = new Map();
+  const walk = (o) => {
+    if (Array.isArray(o)) return o.forEach(walk);
+    if (o && typeof o === "object") {
+      const p = o.persistency;
+      if (p && typeof p.id === "string") {
+        if (!ranges.has(p.id)) ranges.set(p.id, []);
+        ranges.get(p.id).push([p.offset, p.offset + p.count]);
+      }
+      Object.values(o).forEach(walk);
+    }
+  };
+  walk(raw.collections.filter((c) => c.name === "$BLOBS_COLLECTION$" || c.name === "$BLOCKS_COLLECTION$").map((c) => c.data));
+  let total = 0, dead = 0, files = 0;
+  for (const [id, rs] of ranges) {
+    const size = fs.statSync(path.join(EXTENT_DIR, id)).size;
+    // Mark live bytes on a bitmap: simple and obviously right for small files.
+    const live = new Uint8Array(size);
+    for (const [s, e] of rs) live.fill(1, s, e);
+    const n = live.reduce((a, b) => a + b, 0);
+    total += size;
+    dead += size - n;
+    files++;
+  }
+  return { total, dead, files };
+}
+
+function checkExtentIndex() {
+  const raw = JSON.parse(fs.readFileSync(EXTENT_DB, "utf8"));
+  const db = new Loki("check-ext.json", { persistenceMethod: "memory" });
+  db.loadJSONObject(raw);
+  const coll = db.getCollection("$EXTENTS_COLLECTION$");
+  for (const id of fs.readdirSync(EXTENT_DIR)) {
+    assert.ok(coll.findOne({ id }), `extent ${id} is listed in the extent DB`);
+  }
+  assert.deepEqual(coll.checkAllIndexes(), [], "extent DB indexes");
 }
 
 function checkIndexes(raw) {
@@ -235,6 +317,12 @@ async function main() {
   await stageOnly(c1, "keep/uncommitted/only-staged");
   await stageOnly(c1, "keep/blocks/0.bin"); // committed blob with an extra pending block
   await stageOnly(c1, "del/b/0.bin");
+  // References that overlap inside one extent, for compaction: page-range
+  // splits point at sub-ranges of an earlier write, and a server-side copy
+  // shares its source's ranges.
+  await splitPages(c1, "keep/page-split");
+  await serverCopy(c1, "keep/blocks/1.bin", "keep/copy-of-blocks-1");
+  await serverCopy(c1, "del/b/1.bin", "keep/copy-of-deleted");
   await stopAzurite(az);
 
   step("Phase 2: populate (only deletable blobs, so their extents become unreferenced)");
@@ -323,15 +411,7 @@ async function main() {
   checkIndexes(after);
   for (const id of expectFreed) assert.ok(fs.existsSync(path.join(EXTENT_DIR, id)), "extents untouched by the tool itself");
 
-  // Azurite's GC ignores extents modified in the last 10 minutes
-  // (DEFAULT_EXTENT_GC_PROTECT_TIME_IN_MS). A real store's extents are old; age
-  // this one's so the startup GC pass considers every extent, referenced or not.
-  const extentDb = path.join(LOC, "__azurite_db_blob_extent__.json");
-  const ext = JSON.parse(fs.readFileSync(extentDb, "utf8"));
-  for (const e of ext.collections.find((c) => c.name === "$EXTENTS_COLLECTION$").data) {
-    e.LastModifyInMS = Date.now() - 60 * 60 * 1000;
-  }
-  fs.writeFileSync(extentDb, JSON.stringify(ext));
+  ageExtents();
 
   step("Restart Azurite: deleted blobs gone, kept blobs intact");
   az = await startAzurite();
@@ -386,6 +466,68 @@ async function main() {
   assert.deepEqual(await listNames(svc.getContainerClient("ctr1"), "del/"), ["del/a/0.bin"]);
   await stopAzurite(az);
   checkIndexes(loadRaw());
+
+  step("Compaction dry run changes nothing");
+  const deadBefore = deadSpace();
+  console.log(`  ${deadBefore.files} extent files, ${deadBefore.dead} dead bytes`);
+  assert.ok(deadBefore.dead > 0, "deletion left dead space inside shared extents");
+  const blobHash = fileHash(BLOB_DB);
+  const extentHash = fileHash(EXTENT_DB);
+  const filesBefore = new Set(fs.readdirSync(EXTENT_DIR));
+  r = runTool("--compact", "--compact-min-dead", "0");
+  console.log(r.out);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /Compaction \(/);
+  assert.ok(r.out.includes(`(${deadBefore.dead.toLocaleString("en-US")} bytes).`), "plan frees exactly the dead bytes");
+  assert.equal(fileHash(BLOB_DB), blobHash);
+  assert.equal(fileHash(EXTENT_DB), extentHash);
+  assert.deepEqual(new Set(fs.readdirSync(EXTENT_DIR)), filesBefore);
+
+  step("Compaction refuses while Azurite runs");
+  az = await startAzurite();
+  r = runTool("--compact", "--compact-min-dead", "0", "--apply");
+  assert.equal(r.code, 1, r.out);
+  assert.deepEqual(new Set(fs.readdirSync(EXTENT_DIR)), filesBefore);
+  await stopAzurite(az);
+
+  step("Compact everything with any dead space");
+  r = runTool("--compact", "--compact-min-dead", "0", "--apply");
+  console.log(r.out);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /wrote and verified \d+ new extent files/);
+  checkIndexes(loadRaw());
+  checkExtentIndex();
+  const afterCompact = deadSpace();
+  assert.equal(afterCompact.dead, 0, "every referenced extent is fully live");
+  ageExtents();
+
+  step("Restart: every blob intact, old extents removed, writes work");
+  az = await startAzurite();
+  svc = client();
+  await verifyContents(svc, "after compaction");
+  let stale;
+  for (let i = 0; i < 120; i++) {
+    stale = [...filesBefore].filter((id) => fs.existsSync(path.join(EXTENT_DIR, id)) && !referencedNow().has(id));
+    if (stale.length === 0) break;
+    await sleep(500);
+  }
+  assert.deepEqual(stale, [], "old extents deleted by GC");
+  const usedAfter = fs.readdirSync(EXTENT_DIR).reduce((s, f) => s + fs.statSync(path.join(EXTENT_DIR, f)).size, 0);
+  console.log(`  __blobstorage__: ${deadBefore.total} -> ${usedAfter} bytes (${deadBefore.dead} dead bytes reclaimed)`);
+  assert.equal(usedAfter, deadBefore.total - deadBefore.dead);
+  await uploadBlocks(svc.getContainerClient("ctr1"), "keep/after-compact.bin", 3);
+  await svc.getContainerClient("ctr1").getBlobClient("keep/small/3.bin").delete();
+  expected.delete(keyOf("ctr1", "keep/small/3.bin"));
+  await verifyContents(svc, "writes after compaction");
+  await stopAzurite(az);
+
+  step("Restart once more after compaction");
+  az = await startAzurite();
+  svc = client();
+  await verifyContents(svc, "second restart after compaction");
+  await stopAzurite(az);
+  checkIndexes(loadRaw());
+  checkExtentIndex();
 
   console.log("\nALL TESTS PASSED");
   fs.rmSync(WORK, { recursive: true, force: true });

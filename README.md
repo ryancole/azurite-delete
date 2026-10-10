@@ -49,7 +49,8 @@ Tested with Azurite 3.35.0 (bundled with Visual Studio 18) and LokiJS 1.5.12.
   delete the whole container; the container itself stays.
 - **`-Target`** covers several containers in one run:
   `-Target images/2024/, thumbnails`.
-- **Other options:** `-Account`, `-BlobPort` (default 10000), `-Samples`, `-NoBackup`.
+- **Other options:** `-Compact` (see [Compacting](#compacting)), `-Account`, `-BlobPort`
+  (default 10000), `-Samples`, `-NoBackup`.
 - **Snapshots and staged blocks:** snapshots and uncommitted blocks of matching blobs are
   deleted too.
 - **No matches:** if a prefix matches nothing, the dry run suggests the container that
@@ -86,6 +87,31 @@ An extent is freed only when *every* blob in it is gone, and Azurite never compa
 extents. The dry run's "becoming unreferenced" line shows what will actually be
 reclaimed. In the example above, that's 33 MB of the 1.31 GB deleted.
 
+### Compacting
+
+`-Compact` reclaims the dead space inside extents that still hold live blobs. It copies
+the live byte ranges into new, packed extent files, verifies the copies, and repoints
+every blob, snapshot and staged block at them. The old files become unreferenced, and
+Azurite's cleanup deletes them on startup. Compaction runs on its own, or after a delete
+in the same run:
+
+```powershell
+# See the trade-off first (dry run)
+.\etc\azurite-delete.ps1 -Location <azurite folder> -Compact
+
+# Rewrite every extent that is at least 10% dead
+.\etc\azurite-delete.ps1 -Location <azurite folder> -Compact -CompactMinDead 10 -Apply
+```
+
+The dry run shows, for several thresholds, how many files would be rewritten, how much
+would be copied and how much would be freed. `-CompactMinDead` defaults to 25%.
+
+When deleted blobs were spread thinly across many extents, freeing all the dead space
+means copying most of the store. Until Azurite starts, the new files sit next to the
+old ones, so you need free disk space equal to the "copy" column; the tool checks
+first. Until Azurite has started and cleaned up, you can undo by restoring the
+backup.
+
 ## Notes
 
 - **Azure Functions blob triggers:** receipts live in `azure-webjobs-hosts` under
@@ -109,4 +135,6 @@ deletes several containers and prefixes, then restarts Azurite and checks:
 - every kept blob downloads byte-identical;
 - new writes still work;
 - Azurite's cleanup removes exactly the unreferenced extent files;
+- compaction reclaims exactly the dead bytes (measured independently), including with
+  overlapping page ranges, snapshots and server-side copies that share data;
 - the tool refuses to run while Azurite is running.
