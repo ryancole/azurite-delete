@@ -276,14 +276,14 @@ async function main() {
   assert.equal(fs.statSync(BLOB_DB).mtimeMs, mtime);
 
   step("Prefix matching nothing (and unknown container) leaves the database alone");
-  r = runTool("--target", "ctr1/nothing-here/", "--target", "nosuchcontainer", "--apply");
+  r = runTool("--container", "ctr1", "--prefix", "nothing-here/", "--container", "nosuchcontainer", "--apply");
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /Nothing matched/);
   assert.match(r.out, /no container named "nosuchcontainer"/);
   assert.match(r.out, /containers: ctr1 \(\d+\), ctr2 \(\d+\), ctr3 \(\d+\)/);
-  r = runTool("--target", "del/a/");
+  r = runTool("--container", "del", "--prefix", "a/");
   assert.equal(r.code, 0, r.out);
-  assert.match(r.out, /hint: 61 blobs in container "ctr1" start with "del\/a\/"; try --target "ctr1\/del\/a\/"/);
+  assert.match(r.out, /hint: 61 blobs in container "ctr1" start with "del\/a\/"; try container "ctr1" with prefix "del\/a\/"/);
   assert.equal(fileHash(BLOB_DB), before);
   assert.equal(fs.existsSync(path.join(LOC, "azurite-delete-backups")), false);
 
@@ -301,7 +301,7 @@ async function main() {
   const expectBlockDocs = blocksBefore.filter((d) => !docDeleted(d)).length;
   const maxIdBefore = raw.collections.find((c) => c.name === "$BLOBS_COLLECTION$").maxId;
 
-  r = runTool("--target", "ctr1/del/", "--target", "ctr1/del/a/", "--target", "ctr2/x/", "--target", "ctr3", "--apply");
+  r = runTool("--container", "ctr1", "--prefix", "del/", "--prefix", "del/a/", "--container", "ctr2", "--prefix", "x/", "--container", "ctr3", "--apply");
   console.log(r.out);
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, new RegExp(`becoming unreferenced: ${expectFreed.length},`));

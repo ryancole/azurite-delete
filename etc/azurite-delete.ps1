@@ -7,17 +7,24 @@ Dry run by default: prints what would be deleted. Pass -Apply (with Azurite stop
 to delete. See README.md.
 
 .EXAMPLE
-.\etc\azurite-delete.ps1 -Location C:\src\WhatInBox\.azurite -Target images/2024/, thumbnails
+.\etc\azurite-delete.ps1 -Location C:\src\WhatInBox\.azurite -Container images -Prefix "2024/01/", "2024/02/"
 
 .EXAMPLE
-.\etc\azurite-delete.ps1 -Location C:\src\WhatInBox\.azurite -Target images/2024/ -Apply
+.\etc\azurite-delete.ps1 -Location C:\src\WhatInBox\.azurite -Container thumbnails -Apply
+
+.EXAMPLE
+.\etc\azurite-delete.ps1 -Location C:\src\WhatInBox\.azurite -Target images/2024/, thumbnails
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Container')]
 param(
     # Azurite data folder (the one holding __azurite_db_blob__.json).
     [Parameter(Mandatory)] [string] $Location,
-    # One or more "container" or "container/prefix" values.
-    [Parameter(Mandatory)] [string[]] $Target,
+    # Container to delete from.
+    [Parameter(Mandatory, ParameterSetName = 'Container')] [string] $Container,
+    # Blob name prefixes within -Container. Omit to delete the whole container.
+    [Parameter(ParameterSetName = 'Container')] [Alias('Uri', 'Path')] [string[]] $Prefix,
+    # Alternative for several containers at once: "container" or "container/prefix" values.
+    [Parameter(Mandatory, ParameterSetName = 'Target')] [string[]] $Target,
     [switch] $Apply,
     [string] $Account,
     [int] $BlobPort = 10000,
@@ -59,7 +66,16 @@ if (-not (Test-Path (Join-Path $here 'node_modules\lokijs'))) {
 }
 
 $nodeArgs = @('--max-old-space-size=4096', (Join-Path $here 'src\azurite-delete.js'), '--location', $Location)
-foreach ($t in $Target) { $nodeArgs += @('--target', $t) }
+if ($PSCmdlet.ParameterSetName -eq 'Container') {
+    $nodeArgs += @('--container', $Container)
+    # An empty prefix means the whole container, same as no -Prefix. Don't pass it
+    # on: Windows PowerShell drops empty arguments to native commands.
+    if ($Prefix -notcontains '') {
+        foreach ($p in $Prefix) { $nodeArgs += @('--prefix', $p) }
+    }
+} else {
+    foreach ($t in $Target) { $nodeArgs += @('--target', $t) }
+}
 if ($Apply) { $nodeArgs += '--apply' }
 if ($Account) { $nodeArgs += @('--account', $Account) }
 if ($NoBackup) { $nodeArgs += '--no-backup' }

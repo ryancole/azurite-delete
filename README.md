@@ -15,21 +15,30 @@ Verified against **Azurite 3.35.0** (the version bundled with Visual Studio 18) 
 ## Usage
 
 ```powershell
-# Dry run (default): counts, sizes and sample names per target. Changes nothing.
-.\etc\azurite-delete.ps1 -Location C:\Users\ryan\source\repos\WhatInBox\.azurite -Target images/2024/, thumbnails
+# Dry run (default): counts, sizes and sample names. Changes nothing.
+.\etc\azurite-delete.ps1 -Location C:\Users\ryan\source\repos\WhatInBox\.azurite -Container images -Prefix "2024/"
 
 # Delete. Stop Azurite first.
-.\etc\azurite-delete.ps1 -Location C:\Users\ryan\source\repos\WhatInBox\.azurite -Target images/2024/, thumbnails -Apply
+.\etc\azurite-delete.ps1 -Location C:\Users\ryan\source\repos\WhatInBox\.azurite -Container images -Prefix "2024/" -Apply
 ```
 
-Each `-Target` is `container` or `container/prefix`:
+`-Container` is the container name. `-Prefix` is the start of the blob name inside
+that container, without the container (the path you see in Storage Explorer). It takes
+several values, and leaving it out deletes the whole container:
 
-| Target               | Deletes                                                |
-|----------------------|--------------------------------------------------------|
-| `thumbnails`         | every blob in `thumbnails` (the container itself stays) |
-| `images/2024/`       | blobs in `images` whose name starts with `2024/`       |
-| `images/2024`        | also matches `2024-old/...`, `20240101.jpg`, ...       |
+| Parameters                                      | Deletes                                                  |
+|-------------------------------------------------|----------------------------------------------------------|
+| `-Container thumbnails`                         | every blob in `thumbnails` (the container itself stays)  |
+| `-Container images -Prefix "2024/"`             | blobs in `images` whose name starts with `2024/`         |
+| `-Container images -Prefix "2024/01/", "2024/02/"` | both prefixes                                         |
+| `-Container images -Prefix "2024"`              | also matches `2024-old/...`, `20240101.jpg`, ...         |
 
+To cover several containers in one run, use `-Target` with `container` or
+`container/prefix` values instead:
+`-Target images/2024/, thumbnails, "dev-data/Import Test/"`.
+
+If a prefix matches nothing, the dry run says which containers hold blobs whose names
+start with what you typed, so a container name pasted into the prefix is easy to spot.
 Prefix matching is ordinal and case-sensitive, like Azure's own `prefix=` listing.
 Snapshots of matching blobs and uncommitted (staged) blocks of matching blob names are
 deleted too.
@@ -42,7 +51,7 @@ The wrapper finds `node.exe` on PATH or, failing that, the copy inside Visual St
 dependency (`lokijs`) with `npm ci --omit=dev`. You can also call the script directly:
 
 ```
-node src\azurite-delete.js --location <folder> --target images/2024/ --target thumbnails [--apply]
+node src\azurite-delete.js --location <folder> --container images --prefix 2024/ --prefix 2025/01/ --container thumbnails [--apply]
 ```
 
 ## What `--apply` does

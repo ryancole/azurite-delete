@@ -21,12 +21,16 @@ const EXTENTS = "$EXTENTS_COLLECTION$";
 const BACKUP_DIR = "azurite-delete-backups";
 
 const USAGE = `Usage:
+  azurite-delete --location <azurite folder> --container <name> [--prefix <p> ...] [--container ...] [options]
   azurite-delete --location <azurite folder> --target <container>[/<prefix>] [--target ...] [options]
 
-Targets:
-  mycontainer            every blob in the container
-  mycontainer/           same
-  mycontainer/2024/01/   blobs whose name starts with "2024/01/" (ordinal, case-sensitive)
+What to delete:
+  --container images                        every blob in "images"
+  --container images --prefix 2024/01/      blobs in "images" whose name starts with "2024/01/"
+  --container images --prefix a/ --prefix b/ --container thumbs
+                                            several prefixes, then all of "thumbs"
+  --target images/2024/01/                  same as --container images --prefix 2024/01/
+  Prefixes are ordinal and case-sensitive. A --prefix applies to the --container before it.
 
 Options:
   --apply              actually delete (default is a dry run that changes nothing)
@@ -52,12 +56,30 @@ function parseArgs(argv) {
     if (i + 1 >= argv.length) throw new UsageError(`${name} needs a value`);
     return argv[i + 1];
   };
+  // The --container currently collecting --prefix values.
+  let group = null;
+  const endGroup = () => {
+    if (!group) return;
+    if (group.prefixes.length === 0) group.prefixes.push("");
+    for (const prefix of group.prefixes) opts.targets.push({ container: group.container, prefix });
+    group = null;
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
       case "--location":
       case "-l":
         opts.location = value(i++, a);
+        break;
+      case "--container":
+      case "-c":
+        endGroup();
+        group = { container: checkContainer(value(i++, a)), prefixes: [] };
+        break;
+      case "--prefix":
+      case "-p":
+        if (!group) throw new UsageError("--prefix must come after the --container it belongs to");
+        group.prefixes.push(value(i++, a));
         break;
       case "--target":
       case "-t":
@@ -88,21 +110,26 @@ function parseArgs(argv) {
         throw new UsageError(`unknown argument: ${a}`);
     }
   }
+  endGroup();
   if (opts.help) return opts;
   if (!opts.location) throw new UsageError("--location is required");
-  if (opts.targets.length === 0) throw new UsageError("at least one --target is required");
+  if (opts.targets.length === 0) throw new UsageError("at least one --container (or --target) is required");
   return opts;
+}
+
+function checkContainer(name, context = "") {
+  if (!/^[a-z0-9$][a-z0-9-]{1,62}$/.test(name)) {
+    throw new UsageError(`"${name}" is not a valid container name${context}`);
+  }
+  return name;
 }
 
 // "container/prefix" -> {container, prefix}. Container names can't contain "/",
 // so everything after the first "/" is the prefix, verbatim.
 function parseTarget(s) {
   const slash = s.indexOf("/");
-  const container = slash < 0 ? s : s.slice(0, slash);
+  const container = checkContainer(slash < 0 ? s : s.slice(0, slash), ` (target "${s}")`);
   const prefix = slash < 0 ? "" : s.slice(slash + 1);
-  if (!/^[a-z0-9$][a-z0-9-]{1,62}$/.test(container)) {
-    throw new UsageError(`"${container}" is not a valid container name (target "${s}")`);
-  }
   return { container, prefix };
 }
 
@@ -410,7 +437,7 @@ function printTargetHints(t, label, containers, blobs, accountOk, containerKnown
     }
   }
   for (const [container, n] of elsewhere) {
-    console.log(`    hint: ${n.toLocaleString("en-US")} blobs in container "${container}" start with "${label}"; try --target "${container}/${label}"`);
+    console.log(`    hint: ${n.toLocaleString("en-US")} blobs in container "${container}" start with "${label}"; try container "${container}" with prefix "${label}"`);
   }
   if (!containerKnown) {
     console.log(`    containers: ${[...counts].sort().map(([c, n]) => `${c} (${n.toLocaleString("en-US")})`).join(", ") || "(none)"}`);
