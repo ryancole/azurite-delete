@@ -1,0 +1,23 @@
+{
+  "name": "azurite-delete",
+  "version": "1.0.0",
+  "description": "Delete blobs from a local Azurite data folder by editing its LokiJS metadata directly",
+  "private": true,
+  "license": "MIT",
+  "bin": {
+    "azurite-delete": "src/azurite-delete.js"
+  },
+  "scripts": {
+    "test": "node test/e2e.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "lokijs": "1.5.12"
+  },
+  "devDependencies": {
+    "@azure/storage-blob": "12.28.0",
+    "azurite": "3.35.0"
+  }
+}
